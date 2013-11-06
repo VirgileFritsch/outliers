@@ -285,10 +285,13 @@ class MCD(EmpiricalCovariance):
         raw_location, raw_covariance, raw_support = fast_mcd(
             X, objective_function=self.objective_function,
             h=self.h, cov_computation_method=self._nonrobust_covariance)
+        if self.h is None:
+            self.h = int(np.ceil(0.5 * (n_samples + n_features + 1))) \
+                / float(n_samples)
         if self.assume_centered:
             raw_location = np.zeros(n_features)
-            raw_covariance = self._nonrobust_covariance(X[raw_support],
-                                                        assume_centered=True)
+            raw_covariance = self._nonrobust_covariance(
+                X[raw_support], assume_centered=True)
         # get precision matrix in an optimized way
         precision = pinvh(raw_covariance)
         raw_dist = np.sum(np.dot(X, precision) * X, 1)

@@ -114,7 +114,7 @@ class RMCDl2(MCD):
         self.h = h  # always use 50% observations with the RMCD
         self.cov_computation_method = cov_computation_method
 
-    def fit(self, X, n_jobs=1):
+    def fit(self, X, n_jobs=-1):
         """Compute the Minimum Covariance Determinant estimate.
 
         Parameters
@@ -129,6 +129,9 @@ class RMCDl2(MCD):
           Returns self.
 
         """
+        if n_jobs < 1:
+            import multiprocessing as mp
+            n_jobs = mp.cpu_count()
         n_samples, n_features = X.shape
         self.set_optimal_shrinkage_amount(X, method=self.adapt_shrinkage)
         if np.isinf(self.shrinkage):

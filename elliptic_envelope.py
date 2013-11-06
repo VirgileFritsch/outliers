@@ -9,7 +9,7 @@ import scipy as sp
 import matplotlib.pyplot as plt
 from sklearn.covariance import LedoitWolf, EmpiricalCovariance
 
-from covariance import RMCDl2, RMCDl1
+from covariance import MCD, RMCDl2, RMCDl1
 from base import AdvancedOutlierDetectionMixin
 import parietal.outliers_detection.data_generation as dg
 
@@ -68,6 +68,40 @@ class CovarianceOutlierDetectionMixin(AdvancedOutlierDetectionMixin):
             raise("Wrong argument")
         return pvalues
 
+    def decision_function(self, X, raw_values=False):
+        """Compute the decision function of the given observations.
+
+        Parameters
+        ----------
+        X: array-like, shape (n_samples, n_features)
+
+        raw_values: bool
+            Whether or not to consider raw Mahalanobis distances as the
+            decision function. Must be False (default) for compatibility
+            with the others outlier detection tools.
+
+        Returns
+        -------
+        decision: array-like, shape (n_samples, )
+            The values of the decision function for each observations.
+            It is equal to the Mahalanobis distances if `raw_values`
+            is True. By default (``raw_values=True``), it is equal
+            to the cubic root of the shifted Mahalanobis distances.
+            In that case, the threshold for being an outlier is 0, which
+            ensures a compatibility with other outlier detection tools
+            such as the One-Class SVM.
+
+        """
+        mahal_dist = self.mahalanobis(X)
+        if raw_values:
+            decision = mahal_dist
+        else:
+            if self.threshold is None:
+                raise Exception("Please fit data before predicting")
+            decision = mahal_dist - self.threshold
+
+        return decision
+
 
 ###############################################################################
 def tabulate_inliers_expelldata(n_samples, n_features, sigma_root, clf_init):
@@ -75,12 +109,10 @@ def tabulate_inliers_expelldata(n_samples, n_features, sigma_root, clf_init):
                 n_samples, n_features, np.zeros(n_features),
                 cov_root=sigma_root)
             # learn location and shape
-            clf = ExperimentalEllipticData(
+            clf = EllipticEnvelope(
                 correction=clf_init.correction,
-                reweighting=clf_init.reweighting,
                 h=clf_init.support_.sum() / float(n_samples),
-                algorithm=clf_init.algorithm,
-                nonparametric_support=clf_init.nonparametric_support).fit(X1)
+                no_fit=True).fit(X1)
             dist_in = clf.decision_function(X1[clf.support_], raw_values=True)
             h = clf.h
             return dist_in, h
@@ -91,26 +123,23 @@ def tabulate_outliers_expelldata(n_samples, n_features, sigma_root, clf):
                 n_samples, n_features, np.zeros(n_features),
                 cov_root=sigma_root)
             # learn location and shape
-            clf = ExperimentalEllipticData(
-                correction=clf.correction, reweighting=clf.reweighting,
+            clf = EllipticEnvelope(
+                correction=clf.correction,
                 h=clf.support_.sum() / float(n_samples),
-                algorithm=clf.algorithm,
-                nonparametric_support=clf.nonparametric_support).fit(X1)
+                no_fit=True).fit(X1)
             dist_out = clf.decision_function(
                 X1[~clf.support_], raw_values=True)
             h = clf.h
             return dist_out, h
 
 
-class ExperimentalEllipticData(RMCDl2,
-                               CovarianceOutlierDetectionMixin):
+class EllipticEnvelope(MCD, CovarianceOutlierDetectionMixin):
     """Outlier detection with Minimum Covariance Determinant.
 
     """
     def __init__(self, store_precision=True, assume_centered=False,
-                 h=None, correction="empirical", reweighting=None,
-                 algorithm=None, contamination=0.1, pvalue_correction="fwer",
-                 nonparametric_support=False, cov_computation_method=None):
+                 h=None, correction="empirical",
+                 contamination=0.1, pvalue_correction="fwer", no_fit=False):
         """
 
         Parameters
@@ -128,13 +157,6 @@ class ExperimentalEllipticData(RMCDl2,
           value of support_fraction will be used within the algorithm:
           [n_sample + n_features + 1] / 2
         correction: str, in {"empirical", "theoretical"}
-        reweighting: str, in {"rousseeuw", None}
-        algorithm: str, or None
-          Algorithm to be used for the MCD computation.
-          If "fastmcd", the algorithm from Rousseeuw and Van Driessen is used.
-          If None (default), minimization procedures are made from several
-          random initialization, but no division in subsets is made as in
-          Rousseeuw and Van Driessen.
         contamination: float, 0 <= contamination <= 1,
           The thought amount of contamination in the dataset, or the pvalue at
           which it should be thresholded.
@@ -142,15 +164,20 @@ class ExperimentalEllipticData(RMCDl2,
           Correction to be applied to the pvalue when thresholding.
 
         """
-        RMCDl2.__init__(
+        MCD.__init__(
             self, store_precision=store_precision,
-            assume_centered=assume_centered, h=h, shrinkage=0,
-            correction=correction, reweighting=reweighting,
-            algorithm=algorithm, nonparametric_support=nonparametric_support,
-            cov_computation_method=cov_computation_method)
+            assume_centered=assume_centered, h=h, correction=correction)
         CovarianceOutlierDetectionMixin.__init__(
             self, contamination=contamination,
             pvalue_correction=pvalue_correction)
+        self.no_fit = no_fit
+
+    def fit(self, X, n_jobs=-1):
+        MCD.fit(self, X)
+        if not self.no_fit:
+            CovarianceOutlierDetectionMixin.set_threshold(
+                self, X, n_jobs=n_jobs)
+        return self
 
     def correct_pvalue(self, n_tests):
         """Correct p-value according to a given number of samples
@@ -178,10 +205,12 @@ class ExperimentalEllipticData(RMCDl2,
         return res / (1 - self.h)
 
     def threshold_from_simulations(self, X, precision=2000, verbose=False,
-                                   n_jobs=1):
+                                   n_jobs=-1):
         """
         """
         import multiprocessing as mp
+        if n_jobs < 1:
+            n_jobs = mp.cpu_count()
         n_samples, n_features = X.shape
         #lw = LedoitWolf()
         #ref_covariance = lw.fit(X[self.support_]).covariance_
@@ -346,20 +375,20 @@ def tabulate_outliers_expnaivelldata(n_samples, n_features, sigma_root):
         n_samples, n_features, np.zeros(n_features),
         cov_root=sigma_root)
     # learn location and shape
-    clf = ExperimentalNaiveEllipticData().fit(X1)
+    clf = EllipticEnvelopeNaive(no_fit=True).fit(X1)
     X2 = X1 - clf.location_
     dist_out = clf.decision_function(X2, raw_values=True)
     return dist_out
 
 
-class ExperimentalNaiveEllipticData(
+class EllipticEnvelopeNaive(
     EmpiricalCovariance, CovarianceOutlierDetectionMixin):
     """Outlier detection with empirical covariance.
 
     """
     def __init__(self, store_precision=True, assume_centered=False,
-                 h=None, nonparametric_support=False, contamination=0.1,
-                 pvalue_correction="fwer"):
+                 h=None, contamination=0.1, pvalue_correction="fwer",
+                 no_fit=False):
         """
         """
         EmpiricalCovariance.__init__(
@@ -368,12 +397,22 @@ class ExperimentalNaiveEllipticData(
         CovarianceOutlierDetectionMixin.__init__(
             self, contamination=contamination,
             pvalue_correction=pvalue_correction)
+        self.no_fit = no_fit
+
+    def fit(self, X, n_jobs=-1):
+        EmpiricalCovariance.fit(self, X)
+        if not self.no_fit:
+            CovarianceOutlierDetectionMixin.set_threshold(
+                self, X, n_jobs=n_jobs)
+        return self
 
     def threshold_from_simulations(self, X, precision=2000, verbose=False,
-                                   n_jobs=1):
+                                   n_jobs=-1):
         """
         """
         import multiprocessing as mp
+        if n_jobs < 1:
+            n_jobs = mp.cpu_count()
         n_samples, n_features = X.shape
         D, V = np.linalg.eig(self.covariance_)
         sigma_root = np.dot(V, np.diag(np.sqrt(D))).astype(float)
@@ -383,14 +422,14 @@ class ExperimentalNaiveEllipticData(
         if n_jobs == 1:
             for i in range(max_i):
                 res.append(tabulate_outliers_expnaivelldata(
-                        n_samples, n_features, sigma_root, self))
+                        n_samples, n_features, sigma_root))
         else:
             pool = mp.Pool(processes=n_jobs)
             results = []
             for i in range(max_i):
                 results.append(pool.apply_async(
-                    tabulate_inliers_expelldata,
-                    args=(n_samples, n_features, sigma_root, self)))
+                    tabulate_outliers_expnaivelldata,
+                    args=(n_samples, n_features, sigma_root)))
             res = [r.get() for r in results]
             pool.close()
             pool.join()
@@ -442,15 +481,13 @@ class ExperimentalNaiveEllipticData(
 def tabulate_inliers_expregelldata(n_samples, n_features, sigma_root,
                                    clf_init):
     X1, _ = dg.generate_gaussian(
-        n_samples, n_features, np.zeros(n_features),
-        cov_root=sigma_root)
+        n_samples, n_features, np.zeros(n_features), cov_root=sigma_root)
     # learn location and shape
-    clf = ExperimentalRegularizedEllipticData(
-        correction=clf_init.correction, reweighting=clf_init.reweighting,
-        shrinkage=clf_init.shrinkage, algorithm=clf_init.algorithm,
+    clf = EllipticEnvelopeRMCDl2(
+        correction=clf_init.correction, shrinkage=clf_init.shrinkage,
         h=clf_init.support_.sum() / float(n_samples),
-        nonparametric_support=clf_init.nonparametric_support,
-        cov_computation_method=clf_init.cov_computation_method).fit(X1)
+        cov_computation_method=clf_init.cov_computation_method,
+        no_fit=True).fit(X1, n_jobs=1)
     dist_in = clf.decision_function(X1[clf.support_], raw_values=True)
     if clf_init.h != 1:
         dist_out = clf.decision_function(X1[~clf.support_], raw_values=True)
@@ -460,31 +497,32 @@ def tabulate_inliers_expregelldata(n_samples, n_features, sigma_root,
     return dist_in, dist_out, h
 
 
-class ExperimentalRegularizedEllipticData(
-    RMCDl2, CovarianceOutlierDetectionMixin):
+class EllipticEnvelopeRMCDl2(RMCDl2, CovarianceOutlierDetectionMixin):
     """Outlier detection with Regularized Minimum Covariance Determinant (l2).
 
     """
     def __init__(self, store_precision=True, assume_centered=False,
-                 h=0.5, correction="empirical", reweighting=None,
-                 shrinkage=None, nonparametric_support=False, algorithm=None,
+                 h=0.5, correction=None, shrinkage=None,
                  contamination=0.1, pvalue_correction="fwer",
-                 cov_computation_method=None):
+                 cov_computation_method=None, no_fit=False):
         """
         """
         RMCDl2.__init__(
             self, store_precision=store_precision,
             assume_centered=assume_centered, h=h,
-            correction=correction, reweighting=reweighting,
-            algorithm=algorithm, shrinkage=shrinkage,
-            nonparametric_support=nonparametric_support,
+            correction=correction, shrinkage=shrinkage,
             cov_computation_method=cov_computation_method)
         CovarianceOutlierDetectionMixin.__init__(
             self, contamination=contamination,
             pvalue_correction=pvalue_correction)
+        self.no_fit = no_fit
 
-    def fit(self, X, n_jobs=1):
-        return RMCDl2.fit(self, X, n_jobs=n_jobs)
+    def fit(self, X, n_jobs=-1):
+        RMCDl2.fit(self, X, n_jobs=n_jobs)
+        if not self.no_fit:
+            CovarianceOutlierDetectionMixin.set_threshold(
+                self, X, n_jobs=n_jobs)
+        return self
 
     def correct_pvalue(self, n_tests):
         """Correct p-value according to a given number of samples
@@ -511,7 +549,7 @@ class ExperimentalRegularizedEllipticData(
         res = CovarianceOutlierDetectionMixin.correct_pvalue(self, n_tests)
         return res / (1 - self.h)
 
-    def threshold_from_simulations(self, X, precision=1000, verbose=False,
+    def threshold_from_simulations(self, X, precision=2000, verbose=False,
                                    n_jobs=1):
         """
         """
@@ -519,22 +557,22 @@ class ExperimentalRegularizedEllipticData(
         n_samples, n_features = X.shape
         n, p = X.shape
         h = self.support_.sum() / float(self.support_.size)
-        # First learn a RMCD-CV to get a shape-preserving generative covariance
-        rmcd_cv = ExperimentalRegularizedEllipticData(
-            correction=self.correction, shrinkage="cv",
-            h=self.support_.sum() / float(n_samples)).fit(X)
-        self.alt_shrinkage = rmcd_cv.shrinkage
-        self.alt_cov = rmcd_cv
-        #lw = LedoitWolf()
-        #ref_covariance = lw.fit(X[self.support_]).covariance_
-        #c = st.chi2(p + 2).cdf(st.chi2(p).ppf(float(h) / n)) / (float(h) / n)
-        #sigma_root = np.linalg.cholesky(ref_covariance / c)
+        # # First learn a RMCD-CV to get a shape-preserving generative covariance
+        # rmcd_cv = EllipticEnvelopeRMCDl2(
+        #     correction=self.correction, shrinkage="cv",
+        #     h=self.support_.sum() / float(n_samples), no_fit=True).fit(X)
+        # self.alt_shrinkage = rmcd_cv.shrinkage
+        # self.alt_cov = rmcd_cv
+
+        # lw = LedoitWolf()
+        # ref_covariance = lw.fit(X[self.support_]).covariance_
+        c = sp.stats.chi2(p + 2).cdf(sp.stats.chi2(p).ppf(
+                float(h) / n)) / (float(h) / n)
+        # sigma_root = np.linalg.cholesky(ref_covariance / c)
         # TEST
-        ref_covariance = rmcd_cv.covariance_  # * c
-        """
-        ref_covariance = self.covariance_
-        """
+        #ref_covariance = rmcd_cv.covariance_  # * c
         # /TEST
+        ref_covariance = self.covariance_# * c
         #sigma_root = np.linalg.cholesky(ref_covariance)
         D, V = np.linalg.eig(ref_covariance)
         sigma_root = np.dot(V, np.diag(np.sqrt(D))).astype(float)
@@ -560,7 +598,7 @@ class ExperimentalRegularizedEllipticData(
             results = []
             for i in range(max_i):
                 results.append(pool.apply_async(
-                    tabulate_inliers_expelldata,
+                    tabulate_inliers_expregelldata,
                     args=(n_samples, n_features, sigma_root, self)))
             res = [r.get() for r in results]
             pool.close()
@@ -575,14 +613,43 @@ class ExperimentalRegularizedEllipticData(
         self.h_mean = np.mean(all_h)
         return self.dist_out
 
-    def plot_distribution(self):
+    def plot_distribution(self, X=None):
         """
         """
-        plt.plot(np.linspace(0., self.h_mean, self.dist_in.size),
-                 np.sort(self.dist_in), c='m')
-        plt.plot(np.linspace(self.h_mean, 1., self.dist_out.size),
-                 np.sort(self.dist_out), c='r')
-        plt.hlines(self.threshold, plt.xlim()[0], plt.xlim()[1], color='m')
+        n = self.dist_in.size + self.dist_out.size
+        x = np.arange(0., np.amax(self.dist_out), 0.1)
+        all_dist = np.concatenate((self.dist_in, self.dist_out))
+        sigma = 1.05 * np.std(all_dist) * n ** (- 0.2)
+
+        #n = self.dist_in.size
+        #sigma = 1.05 * np.std(self.dist_in) * n ** (- 0.2)
+        n1 = self.dist_in.size
+        kernel_arg = (np.tile(x, (n1, 1)).T - self.dist_in) / sigma
+        fh1 = ((1 / np.sqrt(2 * np.pi))
+              * np.exp(- 0.5 * kernel_arg ** 2)).sum(1) / (n * sigma)
+        plt.plot(x, fh1, c='b')
+
+        #n = self.dist_out.size
+        #sigma = 1.06 * np.std(self.dist_out) * n ** (- 0.2)
+        n2 = self.dist_out.size
+        kernel_arg = (np.tile(x, (n2, 1)).T - self.dist_out) / sigma
+        fh2 = ((1 / np.sqrt(2 * np.pi))
+              * np.exp(- 0.5 * kernel_arg ** 2)).sum(1) / (n * sigma)
+        plt.plot(x, fh2, c='g')
+        plt.plot(x, fh1 + fh2, c='red', linewidth=2)
+
+        # plt.plot(np.linspace(0., self.h_mean, self.dist_in.size),
+        #          np.sort(self.dist_in), c='m')
+        # plt.plot(np.linspace(self.h_mean, 1., self.dist_out.size),
+        #          np.sort(self.dist_out), c='r')
+        # plt.hlines(self.threshold, plt.xlim()[0], plt.xlim()[1], color='m')
+        if X is not None:
+            decision = self.decision_function(X, raw_values=True)
+            plt.scatter(decision, np.zeros(decision.size), c='black')
+        plt.vlines(self.threshold, plt.ylim()[0], plt.ylim()[1], color='gray')
+        plt.xlim((- 0.01 * (plt.xlim()[1] - plt.xlim()[0]),
+                    np.amax(self.dist_out)))
+        plt.ylim((- 0.01 * (plt.ylim()[1] - plt.ylim()[0]), plt.ylim()[1]))
 
 
 ###############################################################################
@@ -591,26 +658,27 @@ class EllipticEnvelopeRMCDl1(
     """Outlier detection with Regularized Minimum Covariance Determinant (l1).
     """
     def __init__(self, store_precision=True, assume_centered=False,
-                 h=None, correction="empirical", reweighting=None,
-                 shrinkage=None, algorithm=None,
+                 h=None, correction=None, shrinkage=None,
                  contamination=0.1, pvalue_correction="fwer",
-                 nonparametric_support=False):
+                 no_fit=False):
         """
         """
         RMCDl1.__init__(
             self, store_precision=store_precision,
-            assume_centered=assume_centered,
-            h=h, correction=correction, reweighting=reweighting,
-            shrinkage=shrinkage, algorithm=algorithm,
-            nonparametric_support=nonparametric_support)
+            assume_centered=assume_centered, h=h, correction=correction,
+            shrinkage=shrinkage)
         CovarianceOutlierDetectionMixin.__init__(
             self, contamination=contamination,
             pvalue_correction=pvalue_correction)
+        self.no_fit = no_fit
 
-    def threshold_from_simulations(self, X, precision=2000, verbose=True,
-                                   n_jobs=1):
+    def threshold_from_simulations(self, X, precision=2000, verbose=False,
+                                   n_jobs=-1):
         """
         """
+        import multiprocessing as mp
+        if n_jobs < 1:
+            n_jobs = mp.cpu_count()
         n_samples, n_features = X.shape
         n = n_samples
         p = n_features
@@ -636,7 +704,8 @@ class EllipticEnvelopeRMCDl1(
             # learn location and shape
             clf = EllipticEnvelopeRMCDl1(
                 correction=self.correction, shrinkage=self.shrinkage,
-                h=self.support_.sum() / float(n_samples)).fit(X1)
+                h=self.support_.sum() / float(n_samples), no_fit=True).fit(
+                X1)
             X2 = X1 - clf.location_
             dist_in = np.concatenate(
                 (dist_in, clf.decision_function(
@@ -655,7 +724,7 @@ class EllipticEnvelopeRMCDl1(
             # learn location and shape
             clf = EllipticEnvelopeRMCDl1(
                 correction=self.correction, shrinkage=self.shrinkage,
-                h=self.support_.sum() / float(n_samples)).fit(X1)
+                h=self.support_.sum() / float(n_samples), no_fit=True).fit(X1)
             X2 = X1 - clf.location_
             dist_out = np.concatenate(
                 (dist_out, clf.decision_function(
@@ -667,24 +736,64 @@ class EllipticEnvelopeRMCDl1(
 
         return self.dist_out
 
-    def plot_distribution(self):
+    def fit(self, X, n_jobs=-1):
+        RMCDl1.fit(self, X)
+        if not self.no_fit:
+            CovarianceOutlierDetectionMixin.set_threshold(
+                self, X, n_jobs=n_jobs)
+        return self
+
+    def plot_distribution(self, X=None):
         """
         """
-        plt.plot(
-            np.linspace(0., self.h_mean, self.dist_in.size, endpoint=False),
-            self.dist_in, c='red', label="inliers")
-        plt.plot(np.linspace(self.h_mean, 1., self.dist_out.size),
-                 self.dist_out, c='m', label="outliers")
-        plt.hlines(self.threshold, plt.xlim()[0], plt.xlim()[1],
-                   color='m', linestyles='dashed', label="threshold")
+        n = self.dist_in.size + self.dist_out.size
+        x = np.arange(0., np.amax(self.dist_out), 0.1)
+        all_dist = np.concatenate((self.dist_in, self.dist_out))
+        sigma = 1.05 * np.std(all_dist) * n ** (- 0.2)
+
+        #n = self.dist_in.size
+        #sigma = 1.05 * np.std(self.dist_in) * n ** (- 0.2)
+        n1 = self.dist_in.size
+        kernel_arg = (np.tile(x, (n1, 1)).T - self.dist_in) / sigma
+        fh1 = ((1 / np.sqrt(2 * np.pi))
+              * np.exp(- 0.5 * kernel_arg ** 2)).sum(1) / (n * sigma)
+        plt.plot(x, fh1, c='b')
+
+        #n = self.dist_out.size
+        #sigma = 1.06 * np.std(self.dist_out) * n ** (- 0.2)
+        n2 = self.dist_out.size
+        kernel_arg = (np.tile(x, (n2, 1)).T - self.dist_out) / sigma
+        fh2 = ((1 / np.sqrt(2 * np.pi))
+              * np.exp(- 0.5 * kernel_arg ** 2)).sum(1) / (n * sigma)
+        plt.plot(x, fh2, c='g')
+        plt.plot(x, fh1 + fh2, c='red', linewidth=2)
+
+        # plt.plot(np.linspace(0., self.h_mean, self.dist_in.size),
+        #          np.sort(self.dist_in), c='m')
+        # plt.plot(np.linspace(self.h_mean, 1., self.dist_out.size),
+        #          np.sort(self.dist_out), c='r')
+        # plt.hlines(self.threshold, plt.xlim()[0], plt.xlim()[1], color='m')
+        if X is not None:
+            decision = self.decision_function(X, raw_values=True)
+            plt.scatter(decision, np.zeros(decision.size), c='black')
+        plt.vlines(self.threshold, plt.ylim()[0], plt.ylim()[1], color='gray')
+        plt.xlim((- 0.01 * (plt.xlim()[1] - plt.xlim()[0]),
+                    np.amax(self.dist_out)))
+        plt.ylim((- 0.01 * (plt.ylim()[1] - plt.ylim()[0]), plt.ylim()[1]))
+        # plt.plot(
+        #     np.linspace(0., self.h_mean, self.dist_in.size, endpoint=False),
+        #     self.dist_in, c='red', label="inliers")
+        # plt.plot(np.linspace(self.h_mean, 1., self.dist_out.size),
+        #          self.dist_out, c='m', label="outliers")
+        # plt.hlines(self.threshold, plt.xlim()[0], plt.xlim()[1],
+        #            color='m', linestyles='dashed', label="threshold")
 
 
 ###############################################################################
 def fit_on_projection(X, clf, n_features, n_proj_dim):
-    mcd = ExperimentalEllipticData(
-        correction=None,
-        contamination=clf.contamination,
-        pvalue_correction=clf.pvalue_correction)
+    mcd = EllipticEnvelope(correction=None, contamination=clf.contamination,
+                           pvalue_correction=clf.pvalue_correction,
+                           no_fit=True)
     projector = np.linalg.svd(
         np.random.normal(size=(n_features, n_features)))[2]
     Xi = np.dot(X, projector[:, 0:(n_proj_dim + 1)])
@@ -697,28 +806,29 @@ class EllipticEnvelopeRMCDRP(AdvancedOutlierDetectionMixin):
     """
     """
     def __init__(self, contamination=0.1, pvalue_correction="fwer",
-                 n_projections=None, n_proj_dim=None):
+                 n_projections=None, n_proj_dim=None, no_fit=False):
         AdvancedOutlierDetectionMixin.__init__(
             self, contamination=contamination,
             pvalue_correction=pvalue_correction)
         self.n_proj_dim = n_proj_dim
         self.n_projections = n_projections
+        self.no_fit = no_fit
 
-    def fit(self, X, n_jobs=1):
+    def fit(self, X, n_jobs=-1):
         """
         """
         import multiprocessing as mp
+        if n_jobs < 1:
+            n_jobs = mp.cpu_count()
         self.mcds = []
         self.projectors = []
         if X.shape[1] <= 10:
-            actual_n_proj_dim = 1
-        else:
-            actual_n_proj_dim = self.n_proj_dim
+            self.n_proj_dim = 1
         n_samples, n_features = X.shape
-        if actual_n_proj_dim is None:
-            actual_n_proj_dim = n_features
+        if self.n_proj_dim is None:
+            self.n_proj_dim = n_features
         if self.n_projections is None:
-            self.n_projections = n_features / 5
+            self.n_projections = max(n_features / 5, min(n_features, 5))
 
         self.mahal = []
         self.mcds = []
@@ -727,14 +837,14 @@ class EllipticEnvelopeRMCDRP(AdvancedOutlierDetectionMixin):
         if n_jobs == 1:
             for i in xrange(self.n_projections):
                 res.append(fit_on_projection(
-                    X, self, n_features, actual_n_proj_dim))
+                    X, self, n_features, self.n_proj_dim))
         else:
             pool = mp.Pool(processes=n_jobs)
             results = []
             for i in xrange(self.n_projections):
                 results.append(pool.apply_async(
                     fit_on_projection,
-                    args=(X, self, n_features, actual_n_proj_dim)))
+                    args=(X, self, n_features, self.n_proj_dim)))
             res = [r.get() for r in results]
             pool.close()
             pool.join()
@@ -744,6 +854,16 @@ class EllipticEnvelopeRMCDRP(AdvancedOutlierDetectionMixin):
             self.mcds.append(mcd_)
             self.projectors.append(projector_)
         self.mahal = np.asarray(self.mahal)
+
+        if not self.no_fit:
+            mcd = self.mcds[0]
+            X0 = np.dot(X, self.projectors[0])
+            mcd.set_threshold(
+                X0, method="simulation", n_jobs=n_jobs)
+            corrected_pvalue = self.correct_pvalue(X.shape[0])
+            self.threshold = sp.stats.scoreatpercentile(
+                mcd.dist_out,
+                100 * (1. - (corrected_pvalue / float(1. - mcd.h))))
         return self
 
     def correct_pvalue(self, n_tests):
@@ -771,7 +891,32 @@ class EllipticEnvelopeRMCDRP(AdvancedOutlierDetectionMixin):
         res = AdvancedOutlierDetectionMixin.correct_pvalue(self, n_tests)
         return res / float(self.n_projections)
 
-    def decision_function(self, X, raw_values=True):
+    # def decision_function(self, X, raw_values=True):
+    #     """Compute the decision function of the given observations.
+
+    #     Parameters
+    #     ----------
+    #     X: array-like, shape (n_samples, n_features)
+
+    #     Returns
+    #     -------
+    #     decision: array-like, shape (n_samples, )
+    #         The values of the decision function for each observations.
+
+    #     """
+    #     # Check that the threshold has been defined
+    #     if not raw_values:
+    #         if self.threshold is None:
+    #             # cannot compute decision function with threshold 0
+    #             print "please set threshold first to get adjusted decision."
+
+    #     consensus = np.amax(self.mahal, 0)
+    #     # optionaly modify the decision function so that the threshold is 0
+    #     if not raw_values:
+    #         consensus = consensus - self.threshold
+    #     return consensus
+
+    def decision_function(self, X, raw_values=False):
         """Compute the decision function of the given observations.
 
         Parameters
@@ -790,13 +935,22 @@ class EllipticEnvelopeRMCDRP(AdvancedOutlierDetectionMixin):
                 # cannot compute decision function with threshold 0
                 print "please set threshold first to get adjusted decision."
 
-        consensus = np.amax(self.mahal, 0)
+        all_mahal = np.empty((len(self.mcds), X.shape[0]))
+        for i, mcd in enumerate(self.mcds):
+            projector = self.projectors[i]
+            Xi = np.dot(X, projector[:, 0:(self.n_proj_dim + 1)])
+            all_mahal[i] = mcd.mahalanobis(Xi)
+        consensus = np.amax(all_mahal, 0)
         # optionaly modify the decision function so that the threshold is 0
         if not raw_values:
             consensus = consensus - self.threshold
+
         return consensus
 
-    def predict(self, X, precision=2000, n_jobs=1):
+    def predict(self, X, precision=2000, n_jobs=-1):
+        if n_jobs < 1:
+            import multiprocessing as mp
+            n_jobs = mp.cpu_count()
         mcd = self.mcds[0]
         X0 = np.dot(X, self.projectors[0])
         mcd.set_threshold(
@@ -808,10 +962,12 @@ class EllipticEnvelopeRMCDRP(AdvancedOutlierDetectionMixin):
         is_inlier[np.amax(self.mahal, 0) < threshold] = 1
         return is_inlier
 
-    def compute_pvalues(self, n_jobs=1):
+    def compute_pvalues(self, n_jobs=-1):
         """
         """
         import multiprocessing as mp
+        if n_jobs < 1:
+            n_jobs = mp.cpu_count()
         n_samples = self.mahal.shape[1]
         mcd = self.mcds[0]
         # pvalues = np.ones(n_samples)

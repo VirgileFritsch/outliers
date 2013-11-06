@@ -138,7 +138,8 @@ class AdvancedOutlierDetectionMixin(OutlierDetectionMixin):
 
         return corrected_pvalue
 
-    def set_threshold(self, X, method="simulation", precision=2000, n_jobs=1):
+    def set_threshold(self, X, method="simulation", precision=10000,
+                      n_jobs=-1):
         """Wrapper of the methods used to set the threshold.
 
         Parameters
@@ -169,6 +170,9 @@ class AdvancedOutlierDetectionMixin(OutlierDetectionMixin):
           an "outlyingness" score.
 
         """
+        if n_jobs < 1:
+            import multiprocessing as mp
+            n_jobs = mp.cpu_count()
         n_samples, n_features = X.shape
         corrected_pvalue = self.correct_pvalue(n_samples)
         if method == "simulation":
